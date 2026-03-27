@@ -1,0 +1,91 @@
+[package]
+name = "fastboot"
+version = "1.0.0"
+edition = "2021"
+authors = ["GriefRedd", "AndyWu"]
+description = "Android Fastboot tool rewritten in Rust - High performance, cross-platform"
+license = "BSD-3-Clause"
+repository = "https://github.com/GriefRedd/fastboot-rs"
+homepage = "https://github.com/GriefRedd/fastboot-rs"
+
+[[bin]]
+name = "rust"
+path = "src/main.rs"
+
+[lib]
+name = "fastboot"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+ksud = { path = "../ksud" }
+thiserror = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+rusb = "0.9"
+tokio = { version = "1.35", features = ["full", "sync", "io-util", "fs"] }
+async-channel = "2.1"
+futures = "0.3"
+zip = "0.6"
+indicatif = "0.17"
+byteorder = "1.5"
+log = "0.4"
+env_logger = "0.10"
+hex = "0.4"
+rsa = { version = "0.9", features = ["sha1"] }
+signature = "2.2"
+rand = "0.8"
+sha1 = { version = "0.10", features = ["oid"] }
+base64 = "0.21"
+num-bigint = "0.4"
+num-traits = "0.2"
+walkdir = "2.4"
+zerocopy = { version = "0.7", features = ["derive"] }
+memmap2 = "0.9"
+bytes = "1.5"
+parking_lot = "0.12"
+pin-project-lite = "0.2"
+tempfile = "3.10"
+
+[dev-dependencies]
+proptest = "1.4"
+mockall = "0.12"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-min]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+strip = "symbols"
+
+[profile.release-dev]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = false
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "setupapi", "handleapi", "fileapi", "winnt", "minwindef", "guiddef",
+    "winerror", "consoleapi", "wincon", "winbase", "ioapiset", "winusbio",
+    "usbiodef", "devguid", "errhandlingapi", "synchapi", "winusb", "usbspec",
+    "processenv"
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+gag = "1"
+
+[build-dependencies]
+winres = "0.1"
+
+[features]
+default = []
+rusb-backend = []
+verbose-logging = []
