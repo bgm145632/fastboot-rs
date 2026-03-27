@@ -1,13 +1,14 @@
-# 编译产物
-/target/
+target/
 **/*.rs.bk
-Cargo.lock
-
-# IDE
-.idea/
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+.env
+*.env
 .vscode/
+.idea/
 *.swp
-
-# 系统
-.DS_Store
-Thumbs.db
+*.swo
+*~
