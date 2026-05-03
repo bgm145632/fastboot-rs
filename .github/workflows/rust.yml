@@ -16,6 +16,11 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Build (Windows only, no tests)
+    - name: Build
       run: cargo build --release --verbose
-      # 没有 cargo test
+    
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fastboot-windows
+        path: target/release/fastboot.exe
