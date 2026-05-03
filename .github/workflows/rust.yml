@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
 
 jobs:
   build:
@@ -16,17 +17,23 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Debug project structure
-      run: |
-        echo "=== Project structure ==="
-        ls -la
-        echo "=== Cargo.toml contents ==="
-        cat Cargo.toml
-        echo "=== Available packages ==="
-        cargo tree --workspace
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
     
     - name: Build
-      run: cargo build --release --verbose
+      run: |
+        cargo build --release 2>&1 | tee build.log
+        exit ${PIPESTATUS[0]}
       
+    - name: Upload build log if failed
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: build.log
+    
     - name: Run tests
       run: cargo test --verbose
