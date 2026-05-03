@@ -11,12 +11,22 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
+    
+    - name: Debug project structure
+      run: |
+        echo "=== Project structure ==="
+        ls -la
+        echo "=== Cargo.toml contents ==="
+        cat Cargo.toml
+        echo "=== Available packages ==="
+        cargo tree --workspace
+    
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --release --verbose
+      
     - name: Run tests
       run: cargo test --verbose
