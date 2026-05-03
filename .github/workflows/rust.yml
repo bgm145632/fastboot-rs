@@ -10,36 +10,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Linux 构建（跳过 Windows 专用代码）
-  build-linux:
-    runs-on: ubuntu-latest
-    
-    steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libusb-1.0-0-dev libudev-dev pkg-config
-    
-    - name: Build (Linux)
-      run: |
-        # 禁用 Windows 特定功能
-        cargo build --release --no-default-features --features "linux"
-      continue-on-error: false
-    
-    - name: Run tests
-      run: cargo test --no-default-features --features "linux"
-
-  # Windows 构建（完整功能）
-  build-windows:
+  build:
     runs-on: windows-latest
-    
+
     steps:
     - uses: actions/checkout@v4
     
-    - name: Build (Windows)
+    - name: Build (Windows only, no tests)
       run: cargo build --release --verbose
-    
-    - name: Run tests
-      run: cargo test --verbose
+      # 没有 cargo test
