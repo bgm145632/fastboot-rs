@@ -48,6 +48,20 @@ pub enum Commands {
         target: String,
     },
 
+    // 连字符形式的 reboot 便捷命令：标准 fastboot 与多数 GUI/脚本都直接调
+    // `fastboot reboot-bootloader` 等单命令，缺失会报 unrecognized subcommand。
+    #[command(name = "reboot-bootloader")]
+    RebootBootloader,
+
+    #[command(name = "reboot-fastboot")]
+    RebootFastboot,
+
+    #[command(name = "reboot-recovery")]
+    RebootRecovery,
+
+    #[command(name = "reboot-edl")]
+    RebootEdl,
+
     Flashall {
         #[arg(short, long)]
         wipe: bool,

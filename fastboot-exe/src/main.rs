@@ -144,32 +144,14 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
 
     match cli.command {
         Commands::Devices => {
-            println!("List of devices attached");
-            match crate::adb_winusb_transport::AdbWinUsbDevice::enumerate() {
-                Ok(devices) => {
-                    for info in devices {
-                        let device_path = info.device_path.clone();
-                        match crate::adb_winusb_transport::AdbWinUsbDevice::open_device(
-                            &device_path,
-                        ) {
-                            Ok(mut dev) => match dev.connect() {
-                                Ok(_) => {
-                                    let serial = extract_serial_from_path(&device_path);
-                                    println!("{}\tdevice", serial);
-                                }
-                                Err(_) => {
-                                    let serial = extract_serial_from_path(&device_path);
-                                    println!("{}\tunauthorized", serial);
-                                }
-                            },
-                            Err(_) => {
-                                let serial = extract_serial_from_path(&device_path);
-                                println!("{}\tunauthorized", serial);
-                            }
-                        }
-                    }
-                }
-                Err(_) => {}
+            // 只有以 fastboot 身份(fastboot.exe)调用时才会走到这里：
+            // adb.exe devices 已在 adb_router 中用 adb 枚举处理并提前返回。
+            // 这里按官方 `fastboot devices` 语义，只列处于 fastboot 模式的设备，
+            // 且不打印 "List of devices attached" 表头(否则上层会把表头误判成有设备)。
+            let fastboot_devices =
+                UsbTransport::enumerate_devices().map_err(FastbootError::Transport)?;
+            for dev in &fastboot_devices {
+                println!("{}\tfastboot", dev.serial_number);
             }
             std::process::exit(0);
         }
@@ -196,34 +178,19 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
             cmd_erase(&cli.serial, &partition).await?;
         }
         Commands::Reboot { target } => {
-            let adb_target = match target.as_str() {
-                "fb" | "bootloader" => "bootloader",
-                "fbd" | "fastboot" => "fastboot",
-                "rec" | "recovery" => "recovery",
-                "sid" | "sideload" => "sideload",
-                "edl" => "edl",
-                _ => "",
-            };
-
-            let target_clone = target.clone();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(1500),
-                cmd_reboot(&cli.serial, &target_clone),
-            )
-            .await;
-
-            let adb_devices =
-                crate::adb_winusb_transport::AdbWinUsbDevice::enumerate().unwrap_or_default();
-            if !adb_devices.is_empty() {
-                if let Ok(mut dev) = crate::adb_winusb_transport::AdbWinUsbDevice::open_device(
-                    &adb_devices[0].device_path,
-                ) {
-                    let _ = dev.reboot(adb_target);
-                }
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            std::process::exit(0);
+            reboot_handler(&cli.serial, &target).await;
+        }
+        Commands::RebootBootloader => {
+            reboot_handler(&cli.serial, "bootloader").await;
+        }
+        Commands::RebootFastboot => {
+            reboot_handler(&cli.serial, "fastboot").await;
+        }
+        Commands::RebootRecovery => {
+            reboot_handler(&cli.serial, "recovery").await;
+        }
+        Commands::RebootEdl => {
+            reboot_handler(&cli.serial, "edl").await;
         }
         Commands::Flashall { wipe } => {
             cmd_flashall(&cli.serial, wipe).await?;
@@ -1527,6 +1494,63 @@ async fn cmd_format(
     Ok(())
 }
 
+/// 统一的 reboot 处理：按真实结果决定进程退出码。
+///
+/// 关键修复：旧实现对 `fastboot reboot <target>` 无条件 `exit(0)` 且忽略 cmd_reboot 的错误，
+/// 还会提前打印 "Rebooting to ..."，导致 fastbootd 拒绝 `reboot-edl`（设备回 FAIL）时仍假报成功，
+/// 上层 GUI 据此显示「重启到 EDL 成功」而设备其实纹丝没动。现在：
+///   - 设备接受 reboot 后断开/超时 → 成功（exit 0）
+///   - 设备明确 FAIL / 无响应且无 adb 兜底 → 失败（exit 1，并打印设备返回的原因）
+async fn reboot_handler(serial: &Option<String>, target: &str) {
+    let adb_target = match target {
+        "fb" | "bootloader" => "bootloader",
+        "fbd" | "fastboot" => "fastboot",
+        "rec" | "recovery" => "recovery",
+        "sid" | "sideload" => "sideload",
+        "edl" => "edl",
+        _ => "",
+    };
+
+    // 主路径：cmd_reboot 内部按 adb-server / fastboot 模式分别处理；
+    // driver.send_reboot_command 已区分「断开/超时=成功」与「设备 FAIL=失败」。
+    let primary = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        cmd_reboot(serial, target),
+    )
+    .await;
+    let primary_ok = matches!(primary, Ok(Ok(())));
+
+    // 物理 adb 句柄兜底：仅当主路径未确认成功、且设备确实在 adb 模式时尝试。
+    let mut fallback_ok = false;
+    if !primary_ok {
+        let adb_devices =
+            crate::adb_winusb_transport::AdbWinUsbDevice::enumerate().unwrap_or_default();
+        if !adb_devices.is_empty() {
+            if let Ok(mut dev) = crate::adb_winusb_transport::AdbWinUsbDevice::open_device(
+                &adb_devices[0].device_path,
+            ) {
+                fallback_ok = dev.reboot(adb_target).is_ok();
+            }
+        }
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    if primary_ok || fallback_ok {
+        std::process::exit(0);
+    }
+
+    match primary {
+        Ok(Err(e)) => print_error(&e.to_string()),
+        Err(_) => print_error(&format!(
+            "reboot {} 未确认成功：设备无响应或超时（设备可能不支持该重启目标）",
+            target
+        )),
+        _ => {}
+    }
+    std::process::exit(1);
+}
+
 async fn cmd_reboot(serial: &Option<String>, target: &str) -> Result<(), FastbootError> {
     use adb::client::{adb_cli_reboot_proxy, AdbClient};
 
@@ -2090,15 +2114,24 @@ async fn cmd_flashing(serial: &Option<String>, operation: &str) -> Result<(), Fa
     let transport = open_transport(serial).await?;
     let mut driver = driver::FastbootDriver::new(transport);
 
+    // 标准 fastboot：`fastboot flashing <op>` 直接发送 "flashing <op>"（不带 oem 前缀）。
+    // 此前误用 oem_command 会发成 "oem flashing <op>"，设备 bootloader 无法识别而 FAIL。
     let cmd = format!("flashing {}", operation);
-    let result = driver.oem_command(&cmd).await?;
-
-    if !result.is_empty() {
-        println!("{}", result);
-    } else {
-        print_success(&format!("flashing {} 完成", operation));
+    let (resp, info) = driver.raw_command_with_info(&cmd).await?;
+    for line in &info {
+        println!("(bootloader) {}", line);
     }
-    Ok(())
+    match resp {
+        protocol::Response::Okay(v) => {
+            if !v.is_empty() {
+                println!("{}", v);
+            }
+            print_success(&format!("flashing {} 完成", operation));
+            Ok(())
+        }
+        protocol::Response::Fail(msg) => Err(FastbootError::Device(msg)),
+        _ => Err(FastbootError::Protocol("flashing 返回了非预期响应".into())),
+    }
 }
 
 async fn cmd_create_logical_partition(

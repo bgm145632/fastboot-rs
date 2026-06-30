@@ -7,7 +7,7 @@ use std::process;
 /// 判断本程序是否以 "adb" 身份被调用：只看可执行文件名(去扩展名)是否等于 adb。
 /// 不能用「整条路径包含 adb」来判断——部署目录名为 AdbToolbox 等含 "adb" 字样时会误判，
 /// 致使所有 fastboot 子命令落入兜底分支被当 adb 未知命令而静默 exit(0) 空跑。
-fn invoked_as_adb() -> bool {
+pub fn invoked_as_adb() -> bool {
     env::current_exe()
         .ok()
         .as_deref()
@@ -46,8 +46,20 @@ pub fn try_handle_adb_args() -> Option<i32> {
             println!("Version 34.0.5-10900879");
             process::exit(0);
         }
-        "devices" => handle_devices_native(),
-        "devices-l" => handle_devices_native(),
+        "reboot" => {
+            // adb/fastboot reboot 一律透传给 fastboot CLI 的 Reboot 分支：
+            // 它会枚举 adb 设备(dev.reboot)与 fastboot 设备(cmd_reboot)，把设备送进
+            // bootloader/fastbootd/recovery/system，避免旧逻辑落兜底 exit(0) 空跑。
+            None
+        }
+        "devices" | "devices-l" => {
+            if invoked_as_adb() {
+                handle_devices_native()
+            } else {
+                // 以 fastboot 身份调用：交给 fastboot CLI 的 Devices 列 fastboot 设备。
+                None
+            }
+        }
         "reverse" => handle_reverse(&args[1..]),
         "forward" => handle_forward(&args[1..]),
         "push" => {

@@ -23,7 +23,6 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-ksud = { path = "../ksud" }
 thiserror = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1.35", features = ["full", "sync", "io-util", "fs"] }
@@ -56,6 +55,13 @@ tempfile = "3.10"
 [dev-dependencies]
 proptest = "1.4"
 mockall = "0.12"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [profile.release-min]
 inherits = "release"
@@ -109,7 +115,6 @@ features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-gag = "1"
 
 [build-dependencies]
 winres = "0.1"

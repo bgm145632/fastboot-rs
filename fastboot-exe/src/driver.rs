@@ -500,20 +500,28 @@ impl<T: AsyncTransport> FastbootDriver<T> {
         }
     }
     pub async fn reboot(&mut self) -> Result<(), FastbootError> {
-        let response = self.raw_command(protocol::FB_CMD_REBOOT).await?;
-        match response {
-            Response::Okay(_) => Ok(()),
-            Response::Fail(msg) => Err(FastbootError::Device(msg)),
-            _ => Err(FastbootError::Protocol("Unexpected response".into())),
-        }
+        self.send_reboot_command(protocol::FB_CMD_REBOOT.to_string())
+            .await
     }
     pub async fn reboot_to(&mut self, target: &str) -> Result<(), FastbootError> {
-        let cmd = format!("reboot-{}", target);
-        let response = self.raw_command(&cmd).await?;
-        match response {
-            Response::Okay(_) => Ok(()),
-            Response::Fail(msg) => Err(FastbootError::Device(msg)),
-            _ => Err(FastbootError::Protocol("Unexpected response".into())),
+        self.send_reboot_command(format!("reboot-{}", target)).await
+    }
+    /// 发送 reboot 类命令。语义特殊：命令一旦被设备接受，设备会立即重启导致 USB 连接断开，
+    /// 此时读响应会得到「传输断开/超时」——这属于「重启已生效」的正常结果，按成功处理。
+    /// 只有设备明确回 FAIL（拒绝/不支持该目标，例如 fastbootd 不支持 reboot-edl）才算失败。
+    /// reboot 后重试无意义（设备已离开），故强制单发不重试，避免把成功重启误判后反复重发。
+    async fn send_reboot_command(&mut self, cmd: String) -> Result<(), FastbootError> {
+        let prev_retry = self.auto_retry;
+        self.set_auto_retry(false);
+        let result = self.raw_command(&cmd).await;
+        self.set_auto_retry(prev_retry);
+        match result {
+            Ok(Response::Okay(_)) => Ok(()),
+            Ok(Response::Fail(msg)) => Err(FastbootError::Device(msg)),
+            Ok(_) => Err(FastbootError::Protocol("Unexpected response".into())),
+            // 设备接受 reboot 后立即重启 → 连接断开/超时，是预期的成功信号
+            Err(FastbootError::Transport(_)) | Err(FastbootError::Timeout) => Ok(()),
+            Err(e) => Err(e),
         }
     }
     pub async fn set_active(&mut self, slot: &str) -> Result<(), FastbootError> {
@@ -555,7 +563,10 @@ impl<T: AsyncTransport> FastbootDriver<T> {
     }
 
     pub async fn oem_command(&mut self, cmd: &str) -> Result<String, FastbootError> {
-        let full_cmd = format!("{}:{}", protocol::FB_CMD_OEM, cmd);
+        // 标准 fastboot：`fastboot oem <args>` 在线缆上发送 "oem <args>"（空格分隔）。
+        // 此前用冒号拼成 "oem:edl"，高通等 bootloader 解析 OEM 子命令按空格分词，
+        // 冒号形式会被判为未知命令直接返回 FAIL，导致真机上 oem edl/unlock 等全部失效。
+        let full_cmd = format!("{} {}", protocol::FB_CMD_OEM, cmd);
         let response = self.raw_command(&full_cmd).await?;
         match response {
             Response::Okay(msg) => Ok(msg),
