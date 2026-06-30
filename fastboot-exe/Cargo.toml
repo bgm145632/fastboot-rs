@@ -103,6 +103,8 @@ features = [
     "winusb",
     "usbspec",
     "processenv",
+    "sysinfoapi",
+    "minwinbase",
 ]
 
 [target.'cfg(unix)'.dependencies]

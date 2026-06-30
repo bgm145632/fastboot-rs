@@ -8,6 +8,7 @@ pub mod crypto;
 mod driver;
 mod error;
 mod flash;
+mod logger;
 mod partition;
 mod progress;
 mod protocol;

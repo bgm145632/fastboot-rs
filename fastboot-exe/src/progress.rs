@@ -145,6 +145,24 @@ impl FlashProgress {
     pub fn finish(&self) {
         let elapsed = self.start_time.elapsed();
         let total = self.total_size;
+        let size_str = format_size(total);
+        let time_str = format!("{:.2}s", elapsed.as_secs_f64());
+
+        if self.is_chunked {
+            crate::logger::log_line(&format!(
+                "OKAY  Sending '{}' [{}/{}] ({}) 用时 {}",
+                self.partition,
+                self.chunk_index + 1,
+                self.chunk_total,
+                size_str,
+                time_str
+            ));
+        } else {
+            crate::logger::log_line(&format!(
+                "OKAY  Sending '{}' ({}) 用时 {}",
+                self.partition, size_str, time_str
+            ));
+        }
 
         if is_machine_readable() {
             println!(
@@ -157,8 +175,6 @@ impl FlashProgress {
             );
         } else {
             self.bar.finish_and_clear();
-            let size_str = format_size(total);
-            let time_str = format!("{:.2}s", elapsed.as_secs_f64());
 
             if self.is_chunked {
                 println!(
@@ -178,6 +194,7 @@ impl FlashProgress {
         }
     }
     pub fn finish_with_error(&self, error: &str) {
+        crate::logger::log_line(&format!("FAILED 分区 '{}': {}", self.partition, error));
         if is_machine_readable() {
             println!(
                 r#"{{"type":"error","partition":"{}","error":"{}"}}"#,
@@ -212,6 +229,12 @@ pub struct ChunkedProgress {
 
 impl ChunkedProgress {
     pub fn new(partition: &str, total_size: u64, total_chunks: usize) -> Self {
+        crate::logger::log_line(&format!(
+            "开始刷写 '{}' ({}, 分 {} 块)",
+            partition,
+            format_size(total_size),
+            total_chunks
+        ));
         if !is_machine_readable() {
             println!(
                 "Flashing '{}' ({}, {} chunks)...",
@@ -252,6 +275,14 @@ impl ChunkedProgress {
     pub fn finish(&self) {
         let elapsed = self.start_time.elapsed();
         let speed = self.total_size as f64 / elapsed.as_secs_f64();
+
+        crate::logger::log_line(&format!(
+            "完成刷写 '{}': {} 用时 {:.1}s ({})",
+            self.partition,
+            format_size(self.total_size),
+            elapsed.as_secs_f64(),
+            format_speed(speed)
+        ));
 
         if is_machine_readable() {
             println!(
@@ -313,19 +344,23 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 pub fn print_success(message: &str) {
+    crate::logger::log_line(message);
     if !is_machine_readable() {
         println!("{}", message);
     }
 }
 pub fn print_error(message: &str) {
+    crate::logger::log_line(&format!("错误: {}", message));
     eprintln!("{}", message);
 }
 pub fn print_warning(message: &str) {
+    crate::logger::log_line(&format!("警告: {}", message));
     if !is_machine_readable() {
         eprintln!("{}", message);
     }
 }
 pub fn print_info(message: &str) {
+    crate::logger::log_line(message);
     if !is_machine_readable() {
         println!("{}", message);
     }

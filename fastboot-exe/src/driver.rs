@@ -8,6 +8,9 @@ use crate::error::{FastbootError, RetCode, TransportError};
 use crate::protocol::{self, Response, FB_COMMAND_SZ, FB_RESPONSE_SZ};
 use crate::transport::{AsyncTransport, AsyncTransportExt};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// flash 擦写阶段的独立长超时：super 等大分区擦写期间设备可能长时间不回包，
+/// 用 30s 常规超时会误判超时并打断正在进行的刷写。600s 远大于单次 flash 实际耗时，足够安全。
+const FLASH_TIMEOUT: Duration = Duration::from_secs(600);
 const DOWNLOAD_CHUNK_SIZE: usize = 1 * 1024 * 1024;
 const UPLOAD_CHUNK_SIZE: usize = 1024 * 1024;
 const MAX_RETRY_COUNT: u32 = 3;
@@ -40,6 +43,7 @@ pub struct FastbootDriver<T: AsyncTransport> {
     callbacks: DriverCallbacks,
     disable_checks: bool,
     timeout: Duration,
+    flash_timeout: Duration,
     last_error: String,
     max_download_size: Option<u64>,
     auto_retry: bool,
@@ -54,6 +58,7 @@ impl<T: AsyncTransport> FastbootDriver<T> {
             callbacks: DriverCallbacks::default(),
             disable_checks: false,
             timeout: DEFAULT_TIMEOUT,
+            flash_timeout: FLASH_TIMEOUT,
             last_error: String::new(),
             max_download_size: None,
             auto_retry: true,
@@ -61,11 +66,25 @@ impl<T: AsyncTransport> FastbootDriver<T> {
             consecutive_failures: 0,
         }
     }
+    /// 消费 driver，取回底层 transport。
+    /// 用于 open 阶段：用临时 driver 探测句柄能否真正 IO 后，把可用连接交还调用方。
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
     pub fn set_callbacks(&mut self, callbacks: DriverCallbacks) {
         self.callbacks = callbacks;
     }
     pub fn set_progress_callback(&mut self, callback: ProgressCallback) {
         self.callbacks.progress = Some(callback);
+    }
+    /// 设置 INFO 回调（设备在 flash/erase 等阶段回传的 INFO 心跳，含进度文本时调用方可据此推进进度）。
+    /// 单独设置，不影响已设置的 progress 回调。
+    pub fn set_info_callback(&mut self, callback: Box<dyn Fn(&str) + Send + Sync>) {
+        self.callbacks.info = callback;
+    }
+    /// 设置 prolog 回调（命令开始时触发，如 "Writing 'super'" / "Erasing 'userdata'"）。
+    pub fn set_prolog_callback(&mut self, callback: Box<dyn Fn(&str) + Send + Sync>) {
+        self.callbacks.prolog = callback;
     }
     pub fn disable_checks(&mut self) {
         self.disable_checks = true;
@@ -73,6 +92,10 @@ impl<T: AsyncTransport> FastbootDriver<T> {
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
         self.transport.set_timeout(timeout);
+    }
+    /// 设置 flash 擦写阶段的独立超时（默认 600s）。用于覆盖大分区超长擦写场景。
+    pub fn set_flash_timeout(&mut self, timeout: Duration) {
+        self.flash_timeout = timeout;
     }
     pub fn set_auto_retry(&mut self, enabled: bool) {
         self.auto_retry = enabled;
@@ -380,7 +403,21 @@ impl<T: AsyncTransport> FastbootDriver<T> {
         let cmd = format!("{}:{}", protocol::FB_CMD_FLASH, partition);
         (self.callbacks.prolog)(&format!("Writing '{}'", partition));
 
-        let response = self.raw_command(&cmd).await?;
+        // flash 阶段设备要擦除+写入，super 等大分区常需数十秒到数分钟，期间可能完全不回包。
+        // 1) 用独立长超时(flash_timeout)代替 30s 常规超时，避免把正在进行的擦写误判为超时。
+        // 2) 直接走 send_command_internal(不带重试)：flash 命令一旦发出绝不能因超时而重发——
+        //    重发会打断设备正在进行的擦写，正是"连续刷写卡顿/打断"的根因。
+        // send_command_internal 内部循环读响应时会把设备的 INFO 心跳转发给 callbacks.info，
+        // 调用方据此可在 flash 期间持续更新进度，不再卡在 100%。
+        let prev_timeout = self.timeout;
+        let flash_timeout = self.flash_timeout.max(prev_timeout);
+        self.set_timeout(flash_timeout);
+
+        let result = self.send_command_internal(&cmd).await;
+
+        self.set_timeout(prev_timeout);
+
+        let (response, _info) = result?;
         match response {
             Response::Okay(_) => {
                 (self.callbacks.epilog)(RetCode::Success);

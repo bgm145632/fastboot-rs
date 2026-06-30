@@ -1,11 +1,10 @@
 use clap::{Parser, Subcommand};
-use ksud::boot_patch::{BootRestoreArgs, GetKmiArgs};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "fastboot")]
 #[command(author = "Fastboot Rust Port")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Android Fastboot/ADB tool rewritten in Rust", long_about = None)]
 pub struct Cli {
     #[arg(short = 's', long, global = true)]
@@ -38,12 +37,6 @@ pub enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         extra_args: Vec<String>,
     },
-
-    #[command(name = "boot-restore")]
-    BootRestore(BootRestoreArgs),
-
-    #[command(name = "get-kmi")]
-    GetKmi(GetKmiArgs),
 
     Erase {
         partition: String,
