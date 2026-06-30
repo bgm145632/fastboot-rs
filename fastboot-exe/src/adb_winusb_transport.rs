@@ -11,8 +11,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInterfaceDetailW, SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W,
 };
 use windows::Win32::Devices::Usb::{
-    WinUsb_Initialize, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe, WinUsb_ReadPipe,
-    WinUsb_WritePipe, USB_INTERFACE_DESCRIPTOR, WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
+    WinUsb_Free, WinUsb_Initialize, WinUsb_QueryInterfaceSettings, WinUsb_QueryPipe,
+    WinUsb_ReadPipe, WinUsb_ResetPipe, WinUsb_WritePipe, USB_INTERFACE_DESCRIPTOR,
+    WINUSB_INTERFACE_HANDLE, WINUSB_PIPE_INFORMATION,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Storage::FileSystem::{
@@ -34,6 +35,8 @@ pub struct AdbWinUsbDevice {
     bulk_out_addr: u8,
     next_local_id: u32,
     is_connected: bool,
+    /// 设备接口路径，用于 connect 失败时按路径重开一个干净句柄（深度恢复）。
+    device_path: String,
 }
 
 pub struct AdbDeviceInfo {
@@ -119,6 +122,24 @@ impl AdbWinUsbDevice {
     }
 
     fn check_adb_protocol(device_path: &str) -> bool {
+        // 连续命令场景下，上个进程退出后内核回收 WinUSB 句柄存在延迟，这里的
+        // CreateFileW/WinUsb_Initialize 会偶发失败，导致设备被漏枚举（表现为
+        // 「devices 列表突然为空」）。打开失败时短退避重试，区分「暂时打不开」
+        // 与「确认不是 ADB 接口」两种情况。
+        const MAX_CHECK_ATTEMPTS: u32 = 6;
+        for attempt in 0..MAX_CHECK_ATTEMPTS {
+            if let Some(is_adb) = Self::try_check_adb_protocol(device_path) {
+                return is_adb;
+            }
+            if attempt + 1 < MAX_CHECK_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(150 * (attempt as u64 + 1)));
+            }
+        }
+        false
+    }
+
+    /// 返回 `Some(是否为 ADB 接口)`；返回 `None` 表示打开/初始化失败（调用方可重试）。
+    fn try_check_adb_protocol(device_path: &str) -> Option<bool> {
         unsafe {
             let path_wide: Vec<u16> = OsStr::new(device_path)
                 .encode_wide()
@@ -135,11 +156,11 @@ impl AdbWinUsbDevice {
             );
 
             if raw_handle.is_err() {
-                return false;
+                return None;
             }
             let handle = raw_handle.unwrap();
             if handle.is_invalid() {
-                return false;
+                return None;
             }
             let device_handle = HANDLE(handle.0);
 
@@ -148,19 +169,22 @@ impl AdbWinUsbDevice {
 
             if result.is_err() {
                 let _ = CloseHandle(device_handle);
-                return false;
+                return None;
             }
 
             let mut iface_desc: USB_INTERFACE_DESCRIPTOR = mem::zeroed();
             let result = WinUsb_QueryInterfaceSettings(winusb_handle, 0, &mut iface_desc);
 
+            // 关键修复：释放接口句柄。原实现只 CloseHandle 没 WinUsb_Free，每次枚举都
+            // 泄漏一个 WinUSB 接口句柄，会让设备一直处于被占用状态、加剧连续命令竞争。
+            let _ = WinUsb_Free(winusb_handle);
             let _ = CloseHandle(device_handle);
 
             if result.is_err() {
-                return false;
+                return Some(false);
             }
 
-            iface_desc.bInterfaceProtocol == 0x01
+            Some(iface_desc.bInterfaceProtocol == 0x01)
         }
     }
 
@@ -172,7 +196,37 @@ impl AdbWinUsbDevice {
         Self::open_device(&devices[0].device_path)
     }
 
+    /// 打开 ADB WinUSB 设备。
+    ///
+    /// 连续命令场景下（每条 adb 子命令是独立进程 + WinUSB 直连），上一个进程退出后
+    /// 内核回收 WinUSB 句柄存在毫秒级延迟；紧接着的新进程可能 open 偶发失败，或虽
+    /// open 成功却拿到上一次会话状态残留的 pipe，导致 connect() 首次 ReadPipe 失败
+    /// （即「push 后紧接 pull 偶发 WinUsb_ReadPipe 失败」的根因）。
+    ///
+    /// 这里用「重试退避 + 打开后复位 bulk 端点」根治：
+    /// - 重试退避：覆盖 CreateFileW / WinUsb_Initialize 因句柄尚未释放而偶发失败；
+    /// - 复位端点：清掉残留在 pipe 上的数据与 STALL 状态，保证本进程首次读写干净。
     pub fn open_device(device_path: &str) -> Result<Self, TransportError> {
+        const MAX_OPEN_ATTEMPTS: u32 = 6;
+        let mut last_err = TransportError::Usb("打开设备失败".into());
+        for attempt in 0..MAX_OPEN_ATTEMPTS {
+            match Self::try_open_device(device_path) {
+                Ok(dev) => return Ok(dev),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < MAX_OPEN_ATTEMPTS {
+                        // 退避递增 80/160/240/…ms，给上一个进程的 USB 句柄释放留出时间
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            80 * (attempt as u64 + 1),
+                        ));
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    fn try_open_device(device_path: &str) -> Result<Self, TransportError> {
         unsafe {
             let path_wide: Vec<u16> = OsStr::new(device_path)
                 .encode_wide()
@@ -212,7 +266,20 @@ impl AdbWinUsbDevice {
                 )));
             }
 
-            let (bulk_in, bulk_out) = Self::find_endpoints(winusb_handle)?;
+            let (bulk_in, bulk_out) = match Self::find_endpoints(winusb_handle) {
+                Ok(eps) => eps,
+                Err(e) => {
+                    // 端点枚举失败也要释放已初始化的 WinUSB 句柄，避免句柄泄漏占用设备
+                    let _ = windows::Win32::Devices::Usb::WinUsb_Free(winusb_handle);
+                    let _ = CloseHandle(device_handle);
+                    return Err(e);
+                }
+            };
+
+            // 复位 bulk 端点：清除上一个进程会话残留在 pipe 上的数据/STALL 状态，
+            // 否则连续命令时本进程首次 ReadPipe 可能读到残留或失败。对全新句柄复位是安全的。
+            let _ = WinUsb_ResetPipe(winusb_handle, bulk_in);
+            let _ = WinUsb_ResetPipe(winusb_handle, bulk_out);
 
             Ok(AdbWinUsbDevice {
                 device_handle,
@@ -221,8 +288,31 @@ impl AdbWinUsbDevice {
                 bulk_out_addr: bulk_out,
                 next_local_id: 1,
                 is_connected: false,
+                device_path: device_path.to_string(),
             })
         }
+    }
+
+    /// 深度恢复：关闭当前（可能因上个进程未释放而无法 IO 的）句柄，按 `device_path`
+    /// 重新打开拿一个干净句柄。用于连续命令竞争下 connect 握手失败的恢复。
+    fn reopen(&mut self) -> Result<(), TransportError> {
+        unsafe {
+            let _ = WinUsb_Free(self.winusb_handle);
+            let _ = CloseHandle(self.device_handle);
+            // 立即置空：若下面重开失败提前返回，Drop 不会二次释放已释放的句柄
+            self.winusb_handle = mem::zeroed();
+            self.device_handle = HANDLE(0);
+        }
+        self.is_connected = false;
+
+        let fresh = Self::try_open_device(&self.device_path)?;
+        self.device_handle = fresh.device_handle;
+        self.winusb_handle = fresh.winusb_handle;
+        self.bulk_in_addr = fresh.bulk_in_addr;
+        self.bulk_out_addr = fresh.bulk_out_addr;
+        // fresh 的句柄已被本结构体接管；forget 掉 fresh，避免其 Drop 关闭我们刚接管的句柄
+        std::mem::forget(fresh);
+        Ok(())
     }
 
     unsafe fn find_endpoints(
@@ -429,7 +519,34 @@ impl AdbWinUsbDevice {
         if self.is_connected {
             return Ok(());
         }
+        // 连续命令竞争下，本句柄可能因上个进程的 WinUSB 句柄尚未被内核释放而「能
+        // Initialize 却无法 IO」（典型表现：发送 A_CNXN 即失败）。对这种坏句柄 reset
+        // pipe 无效，必须重开底层句柄拿干净的，并退避到足以覆盖内核释放延迟。
+        // 注意：等待手机授权是 read 阻塞、不返回 Err，因此不会进入此重试。
+        const MAX_CONNECT_ATTEMPTS: u32 = 6;
+        let mut last_err = String::new();
+        for attempt in 0..MAX_CONNECT_ATTEMPTS {
+            match self.try_connect() {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < MAX_CONNECT_ATTEMPTS {
+                        // WinUSB 设备句柄在上个进程退出后由驱动释放存在「秒级」延迟，期间
+                        // 新句柄虽能 Initialize 却无法 IO（发 A_CNXN 即失败）。退避必须覆盖
+                        // 该释放窗口，故用较大的线性退避逐次重开重试，确保连续命令最终稳定。
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            250 * (attempt as u64 + 1),
+                        ));
+                        // 重开底层句柄拿干净的；失败则下一轮继续退避重试
+                        let _ = self.reopen();
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
 
+    fn try_connect(&mut self) -> Result<(), String> {
         // 1. 发送初始的 A_CNXN
         let (header, banner) = crate::adb_protocol::make_connection_message();
         self.write_header(&header).map_err(|_| "发送 A_CNXN 失败")?;
@@ -461,6 +578,7 @@ impl AdbWinUsbDevice {
                         Vec::new()
                     };
                     self.is_connected = true;
+                    crate::logger::log_line("ADB 认证成功，连接已建立");
                     return Ok(());
                 }
                 0x48545541 => {
@@ -480,6 +598,9 @@ impl AdbWinUsbDevice {
                         if auth_attempts == 0 {
                             // 第一次收到 Token：尝试签名并发送
                             auth_attempts += 1;
+                            crate::logger::log_line(
+                                "ADB 收到认证令牌，已用持久化密钥签名应答（设备若曾授权则免弹窗）",
+                            );
                             if let Ok(signature) = crate::crypto::sign_token(&priv_pem, &payload) {
                                 let auth_header =
                                     AdbMessageHeader::new(A_AUTH, 2, 0, signature.len() as u32);
@@ -497,6 +618,9 @@ impl AdbWinUsbDevice {
                         }
 
                         if auth_attempts == 1 {
+                            crate::logger::log_line(
+                                "ADB 等待授权：设备未识别本机公钥，已发送公钥，请在手机点击「允许 USB 调试」",
+                            );
                             println!(
                                 "请点亮手机屏幕并点击「允许 USB 调试」"
                             );

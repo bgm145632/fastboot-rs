@@ -8,6 +8,7 @@ mod crypto;
 mod driver;
 mod error;
 mod flash;
+mod logger;
 mod partition;
 mod progress;
 mod protocol;
@@ -30,44 +31,12 @@ use error::FastbootError;
 use flash::ImageSource;
 use progress::{
     format_size, format_speed, print_error, print_info, print_success, set_machine_readable,
-    ChunkedProgress, FlashProgress, SimpleProgressBar, Spinner,
+    ChunkedProgress, FlashProgress, Spinner,
 };
 use usb_transport::UsbTransport;
 
 const USB_SMART_ROUTE_MSG: &str =
     "   USB 端口被占用且智能路由失败。请检查设备是否已授权，或尝试以管理员身份运行。";
-
-#[cfg(unix)]
-struct KsudSilence {
-    _stdout: Option<gag::Gag>,
-    _stderr: Option<gag::Gag>,
-}
-
-#[cfg(unix)]
-impl KsudSilence {
-    fn new(enable: bool) -> Self {
-        if !enable {
-            return Self {
-                _stdout: None,
-                _stderr: None,
-            };
-        }
-        Self {
-            _stdout: gag::Gag::stdout().ok(),
-            _stderr: gag::Gag::stderr().ok(),
-        }
-    }
-}
-
-#[cfg(not(unix))]
-struct KsudSilence;
-
-#[cfg(not(unix))]
-impl KsudSilence {
-    fn new(_enable: bool) -> Self {
-        Self
-    }
-}
 
 fn parse_flash_extra_args(
     extra: &[String],
@@ -106,19 +75,21 @@ fn parse_flash_extra_args(
 
 #[cfg(target_os = "windows")]
 fn ensure_usb_handle_released() {
-    let _ = std::process::Command::new("adb")
-        .args(["kill-server"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let _ = std::process::Command::new("taskkill")
+    // 设备处于 fastboot 模式时 adb 并不占用它，这里只是「以防万一」释放可能残留的句柄。
+    // 旧实现每次都起 adb kill-server + taskkill + 硬睡 500ms，导致每条 fastboot 命令
+    // （GUI 批量刷写更是每个分区一次）固定空等约 0.6~1s。改为：只用 taskkill 静默尝试结束
+    // adb.exe，没命中则立即返回；只有确实杀到了 adb 才短暂等待句柄释放。
+    let killed = std::process::Command::new("taskkill")
         .args(["/F", "/IM", "adb.exe", "/T"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if killed {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -144,26 +115,10 @@ async fn resolve_boot_ab_partition_name(
     }
 }
 
-fn cmd_get_kmi(args: ksud::boot_patch::GetKmiArgs) -> Result<(), FastbootError> {
-    ksud::boot_patch::get_kmi(args).map_err(|e| {
-        FastbootError::InvalidArg(format!("无法提取 KMI 版本，请检查镜像是否合法：{e}"))
-    })
-}
-
-fn cmd_boot_restore(
-    args: ksud::boot_patch::BootRestoreArgs,
-    verbose: bool,
-) -> Result<(), FastbootError> {
-    let _silence = KsudSilence::new(!verbose);
-    ksud::boot_patch::restore(args)
-        .map_err(|e| FastbootError::InvalidArg(format!("KernelSU 还原失败：{e}")))?;
-    println!("还原完成。");
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
+    logger::log_invocation();
 
     if let Some(exit_code) = adb_router::try_handle_adb_args() {
         std::process::exit(exit_code);
@@ -236,12 +191,6 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
                 kmi.as_deref(),
             )
             .await?;
-        }
-        Commands::BootRestore(args) => {
-            cmd_boot_restore(args, cli.verbose)?;
-        }
-        Commands::GetKmi(args) => {
-            cmd_get_kmi(args)?;
         }
         Commands::Erase { partition } => {
             cmd_erase(&cli.serial, &partition).await?;
@@ -328,10 +277,15 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
                         &dev_info.device_path,
                     ) {
                         match dev.push(local_str, remote_str) {
-                            Ok(_) => println!("Push 成功"),
-                            Err(e) => eprintln!("Push 失败 {}", e),
+                            Ok(_) => {
+                                println!("{}: 1 file pushed", remote_str);
+                                std::process::exit(0);
+                            }
+                            Err(e) => {
+                                eprintln!("Push 失败 {}", e);
+                                std::process::exit(1);
+                            }
                         }
-                        std::process::exit(0);
                     }
                 }
             }
@@ -367,13 +321,19 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
                 };
 
                 match dev.pull(&remote, &final_path) {
-                    Ok(_) => println!("文件已保存至 {}", final_path),
-                    Err(e) => eprintln!("拉取失败 {}", e),
+                    Ok(_) => {
+                        println!("文件已保存至 {}", final_path);
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("拉取失败 {}", e);
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 eprintln!("无法打开物理设备句柄");
+                std::process::exit(1);
             }
-            std::process::exit(0);
         }
         Commands::Install { apk, replace } => {
             let apk_str = apk.to_str().unwrap_or("");
@@ -579,10 +539,10 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
             fs_type,
             size,
         } => {
-            print_info(&format!("format {} 暂未实现", partition));
+            cmd_format(&cli.serial, &partition, fs_type.as_deref(), size.as_deref()).await?;
         }
         Commands::Boot { kernel, ramdisk } => {
-            print_info("boot 命令暂未实现");
+            cmd_boot(&cli.serial, &kernel, ramdisk.as_deref()).await?;
         }
         Commands::Fetch { partition, output } => {
             cmd_upload(&cli.serial, &partition, &output).await?;
@@ -597,19 +557,19 @@ async fn run(cli: Cli) -> Result<(), FastbootError> {
             cmd_resize_logical_partition(&cli.serial, &name, size).await?;
         }
         Commands::SnapshotUpdate { operation } => {
-            print_info(&format!("snapshot-update {} 暂未实现", operation));
+            cmd_snapshot_update(&cli.serial, &operation).await?;
         }
         Commands::Gsi { operation } => {
-            print_info(&format!("gsi {} 暂未实现", operation));
+            cmd_gsi(&cli.serial, &operation).await?;
         }
         Commands::WipeSuper { super_empty } => {
-            print_info("wipe-super 暂未实现");
+            cmd_wipe_super(&cli.serial, super_empty.as_deref()).await?;
         }
         Commands::Stage { input } => {
-            print_info("stage 暂未实现");
+            cmd_stage(&cli.serial, &input).await?;
         }
         Commands::GetStaged { output } => {
-            print_info("get_staged 暂未实现");
+            cmd_get_staged(&cli.serial, &output).await?;
         }
     }
 
@@ -657,7 +617,20 @@ async fn cmd_devices() -> Result<(), FastbootError> {
 }
 
 fn extract_serial_from_path(path: &str) -> String {
-    path.split('\\').last().unwrap_or("unknown").to_string()
+    // 设备路径形如: \\?\usb#vid_18d1&pid_4ee7#a7ab3ab5#{guid}
+    // 序列号是按 '#' 分割后的第 3 段(index 2)。
+    let parts: Vec<&str> = path.split('#').collect();
+    if parts.len() >= 3 {
+        let serial = parts[2];
+        if !serial.is_empty()
+            && !serial.starts_with('{')
+            && !serial.contains('&')
+            && serial.len() < 64
+        {
+            return serial.to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 async fn get_fastboot_mode(serial: &str) -> &'static str {
@@ -758,61 +731,76 @@ impl Drop for PatchArtifactGuard {
     }
 }
 
+/// 给 CLI driver 接上 fastboot 风格状态回调：把命令开始(prolog，如 "Writing 'super'")
+/// 与设备 INFO 心跳转发到 stderr。GUI(Commander) 解析 stderr 时据此进入 writing 阶段
+/// 并推进进度，flash 期间不再卡在发送完成的 100%。用于无 steady-tick 进度条的批量刷写流程。
+fn attach_cli_status_callbacks(driver: &mut driver::FastbootDriver<UsbTransport>) {
+    driver.set_prolog_callback(Box::new(|msg: &str| {
+        eprintln!("{}", msg);
+    }));
+    driver.set_info_callback(Box::new(|msg: &str| {
+        eprintln!("(bootloader) {}", msg);
+    }));
+}
+
+/// 为批量刷写（flashall/update）的单个分区挂上「带实时速率」的实时进度条。
+/// 发送阶段按 1MB 增量推进、展示实时速率；flash 阶段把 "Writing 'x'" 与设备 INFO 心跳
+/// 转发显示，避免卡在发送完成的 100%。返回的 ProgressBar 由调用方在 download/flash 结束后 finish。
+fn setup_live_progress(
+    driver: &mut driver::FastbootDriver<UsbTransport>,
+    label: &str,
+    total: u64,
+) -> std::sync::Arc<ProgressBar> {
+    let pb = ProgressBar::new(total);
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} {msg} [{bar:30.cyan/blue}] {bytes:>10}/{total_bytes:10} {binary_bytes_per_sec:>11} ({eta})")
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏  "),
+    );
+    pb.set_message(format!("Sending '{}'", label));
+
+    let pb_arc = std::sync::Arc::new(pb);
+
+    let pb_inc = pb_arc.clone();
+    driver.set_progress_callback(Box::new(move |delta, _total| {
+        pb_inc.inc(delta);
+    }));
+    // flash 阶段：把 "Writing 'x'" 显示到进度条消息位，设备 INFO 心跳打印到上方，
+    // 既给人看实时状态，也让 GUI 解析 stderr 推进 writing 进度。
+    let pb_prolog = pb_arc.clone();
+    driver.set_prolog_callback(Box::new(move |msg: &str| {
+        pb_prolog.set_message(msg.to_string());
+    }));
+    let pb_info = pb_arc.clone();
+    driver.set_info_callback(Box::new(move |msg: &str| {
+        pb_info.println(format!("(bootloader) {}", msg));
+    }));
+
+    pb_arc
+}
+
 async fn cmd_flash(
     serial: &Option<String>,
     partition: &str,
     filename: &Path,
     verbose: bool,
     patch_module: Option<&Path>,
-    kmi_override: Option<&str>,
+    _kmi_override: Option<&str>,
 ) -> Result<(), FastbootError> {
-    const PATCHED_IMG_NAME: &str = "temp_patched_for_flash.img";
-
-    let used_kernel_su_patch = patch_module.is_some();
+    let used_kernel_su_patch = false;
 
     if !filename.exists() {
         return Err(FastbootError::ImageNotFound(filename.display().to_string()));
     }
 
-    let mut patch_guard = PatchArtifactGuard { inner: None };
+    let patch_guard = PatchArtifactGuard { inner: None };
 
-    if let Some(ko_path) = patch_module {
-        if !ko_path.exists() {
-            return Err(FastbootError::InvalidArg(format!(
-                " ：找不到指定的内核模块文件：{}",
-                ko_path.display()
-            )));
-        }
-
-        let dir = tempfile::TempDir::new().map_err(FastbootError::Io)?;
-        let out_dir = dir.path().to_path_buf();
-
-        let args = ksud::boot_patch::BootPatchArgs::for_embedded_flash(
-            filename.to_path_buf(),
-            ko_path.to_path_buf(),
-            out_dir,
-            PATCHED_IMG_NAME.to_string(),
-            kmi_override.map(str::to_owned),
-            verbose,
-        );
-
-        {
-            let _silence = KsudSilence::new(!verbose);
-            ksud::boot_patch::patch(args).map_err(|e| {
-                FastbootError::InvalidArg(format!(
-                    " ：KernelSU 修补失败（已中止刷机，未向设备写入数据）：{e}"
-                ))
-            })?;
-        }
-
-        let out_path = dir.path().join(PATCHED_IMG_NAME);
-        if !out_path.is_file() {
-            return Err(FastbootError::InvalidArg(
-                "修补流程未生成预期输出镜像，已中止刷机".into(),
-            ));
-        }
-
-        patch_guard.inner = Some((dir, out_path));
+    if patch_module.is_some() {
+        return Err(FastbootError::InvalidArg(
+            "此版本已移除 KernelSU patch 功能（仅保留纯刷写）".into(),
+        ));
     }
 
     let image_to_flash: &Path = match patch_guard.inner.as_ref() {
@@ -852,7 +840,7 @@ async fn cmd_flash(
     let pb = ProgressBar::new(file_size);
     pb.enable_steady_tick(std::time::Duration::from_millis(50));
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes:>10}/{total_bytes:10} ({eta})")
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes:>10}/{total_bytes:10} {binary_bytes_per_sec:>11} ({eta})")
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏  "));
 
@@ -862,6 +850,17 @@ async fn cmd_flash(
 
     driver.set_progress_callback(Box::new(move |sent, total| {
         pb_clone.inc(sent);
+    }));
+
+    // flash 阶段把 "Writing 'x'" 与设备 INFO 心跳通过进度条同步打印到 stderr，
+    // GUI 解析 stderr 后进入 writing 阶段并据此推进进度，不再卡在发送完成的 100%。
+    let pb_prolog = pb_arc.clone();
+    driver.set_prolog_callback(Box::new(move |msg: &str| {
+        pb_prolog.println(msg.to_string());
+    }));
+    let pb_info = pb_arc.clone();
+    driver.set_info_callback(Box::new(move |msg: &str| {
+        pb_info.println(format!("(bootloader) {}", msg));
     }));
 
     let flash_result = if file_size > max_download_size {
@@ -1466,6 +1465,68 @@ async fn cmd_erase(serial: &Option<String>, partition: &str) -> Result<(), Fastb
     Ok(())
 }
 
+async fn cmd_format(
+    serial: &Option<String>,
+    partition: &str,
+    fs_type: Option<&str>,
+    size: Option<&str>,
+) -> Result<(), FastbootError> {
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    // 1) 探测分区文件系统类型（getvar 只读、安全）。命令行 --fs-type 优先于设备上报值。
+    let detected_type = match fs_type {
+        Some(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        _ => driver
+            .get_var(&format!("{}:{}", protocol::FB_VAR_PARTITION_TYPE, partition))
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+
+    // 2) 探测分区大小（getvar 只读）。命令行 --size 优先。
+    let detected_size = match size {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => driver
+            .get_var(&format!("{}:{}", protocol::FB_VAR_PARTITION_SIZE, partition))
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+    };
+
+    print_info(&format!("格式化分区 '{}'", partition));
+    match detected_type {
+        Some(ref t) => print_info(&format!("  文件系统类型: {}", t)),
+        None => print_info("  文件系统类型: 未知（设备未上报 partition-type）"),
+    }
+    if let Some(ref s) = detected_size {
+        match partition::parse_partition_size(s) {
+            Ok(bytes) => print_info(&format!("  分区大小: {} ({})", format_size(bytes), s)),
+            Err(_) => print_info(&format!("  分区大小: {}", s)),
+        }
+    }
+
+    // 3) 擦除分区以清空数据。
+    //    fastboot 协议层没有「设备端格式化」命令——标准 fastboot 的 format 是在主机端用
+    //    mkfs 生成空 ext4/f2fs 镜像再 flash。纯主机端重写 mkfs（尤其 ext4 journal）风险极高
+    //    且难以充分验证，一旦元数据有误会导致分区无法挂载。这里采用对量产设备稳妥、无变砖
+    //    风险的等价路径：擦除分区。对 ext4/f2fs 数据类分区（userdata/metadata/cache），设备
+    //    下次开机会由 vold/init 按 fstab 自动重建文件系统，效果等价于格式化。
+    driver.erase(partition).await?;
+
+    print_success(&format!("分区 '{}' 已格式化（已擦除）", partition));
+    if let Some(ref t) = detected_type {
+        let tl = t.to_ascii_lowercase();
+        if tl.contains("ext4") || tl.contains("f2fs") {
+            print_info(&format!("  设备下次开机将自动重建 {} 文件系统", t));
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_reboot(serial: &Option<String>, target: &str) -> Result<(), FastbootError> {
     use adb::client::{adb_cli_reboot_proxy, AdbClient};
 
@@ -1552,6 +1613,7 @@ async fn cmd_reboot(serial: &Option<String>, target: &str) -> Result<(), Fastboo
 async fn cmd_flashall(serial: &Option<String>, wipe: bool) -> Result<(), FastbootError> {
     let transport = open_transport(serial).await?;
     let mut driver = driver::FastbootDriver::new(transport);
+    attach_cli_status_callbacks(&mut driver);
 
     print_info("准备刷写所有分区...");
 
@@ -1636,13 +1698,19 @@ async fn cmd_flashall(serial: &Option<String>, wipe: bool) -> Result<(), Fastboo
         );
 
         let data = fs::read(path).map_err(FastbootError::Io)?;
-        let mut pb = SimpleProgressBar::new(data.len() as u64, "Sending");
+        let pb = setup_live_progress(&mut driver, &part_name, data.len() as u64);
 
         driver.download(&data).await?;
-        pb.update(data.len() as u64 / 2);
-
         driver.flash(&part_name).await?;
-        pb.finish();
+
+        pb.finish_and_clear();
+        println!(
+            "[{}/{}] Writing '{}' ({})                    OKAY",
+            i + 1,
+            all_images.len(),
+            part_name,
+            format_size(data.len() as u64)
+        );
     }
 
     if wipe {
@@ -1681,6 +1749,7 @@ async fn cmd_update(serial: &Option<String>, filename: &Path) -> Result<(), Fast
 
     let transport = open_transport(serial).await?;
     let mut driver = driver::FastbootDriver::new(transport);
+    attach_cli_status_callbacks(&mut driver);
 
     for (i, task) in tasks.iter().enumerate() {
         println!(
@@ -1696,13 +1765,19 @@ async fn cmd_update(serial: &Option<String>, filename: &Path) -> Result<(), Fast
             .read_file(&task.filename)
             .map_err(FastbootError::Io)?;
 
-        let mut pb = SimpleProgressBar::new(data.len() as u64, "Sending");
+        let pb = setup_live_progress(&mut driver, &task.partition, data.len() as u64);
 
         driver.download(&data).await?;
-        pb.update(data.len() as u64 / 2);
-
         driver.flash(&task.partition).await?;
-        pb.finish();
+
+        pb.finish_and_clear();
+        println!(
+            "[{}/{}] Writing '{}' ({})                    OKAY",
+            i + 1,
+            tasks.len(),
+            task.partition,
+            format_size(data.len() as u64)
+        );
     }
 
     print_success("\n更新完成!");
@@ -1795,6 +1870,35 @@ async fn cmd_diagnose() -> Result<(), FastbootError> {
 async fn open_transport(serial: &Option<String>) -> Result<UsbTransport, FastbootError> {
     ensure_usb_handle_released();
 
+    // 情况B（批量刷写 = 很多条独立 `fastboot flash`，每条一个新进程）：上个 fastboot 进程退出后
+    // WinUSB 设备句柄由内核释放存在「秒级」延迟，期间新进程虽能 open/Initialize 却无法 IO
+    // （首个 getvar 即失败）。这里 open 后用只读 getvar:version 探测句柄是否真能 IO，失败则丢弃
+    // 坏句柄、线性退避后重开，确保连续独立刷写命令不再卡住（与 ADB 侧 reopen+退避同一思路）。
+    // 注意：设备处于 fastboot 模式时枚举不打开句柄，故「枚举为空/多设备」是确定性结果，直接失败不退避。
+    const MAX_OPEN_ATTEMPTS: u32 = 6;
+    let mut last_err = FastbootError::NoDevice;
+
+    for attempt in 0..MAX_OPEN_ATTEMPTS {
+        match try_open_transport_probed(serial).await {
+            Ok(transport) => return Ok(transport),
+            // 确无设备 / 多设备：非句柄竞争，立即返回不重试、不退避
+            Err(e @ (FastbootError::NoDevice | FastbootError::MultipleDevices)) => return Err(e),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < MAX_OPEN_ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        250 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+/// 打开 fastboot 传输并用只读 getvar 探测句柄是否真正可用（单次尝试，重试/退避由 open_transport 统一负责）。
+async fn try_open_transport_probed(serial: &Option<String>) -> Result<UsbTransport, FastbootError> {
     let devices = UsbTransport::enumerate_devices().map_err(FastbootError::Transport)?;
 
     if devices.is_empty() {
@@ -1805,13 +1909,26 @@ async fn open_transport(serial: &Option<String>) -> Result<UsbTransport, Fastboo
         return Err(FastbootError::MultipleDevices);
     }
 
-    UsbTransport::open(serial.as_deref()).map_err(|e| {
+    let transport = UsbTransport::open(serial.as_deref()).map_err(|e| {
         if e.is_usb_access_denied() {
             FastbootError::InvalidArg(USB_SMART_ROUTE_MSG.into())
         } else {
             FastbootError::Transport(e)
         }
-    })
+    })?;
+
+    // 用临时 driver 只读探测 getvar:version：确认句柄真能 IO（坏句柄会在发包即失败）。
+    // 单发不自重试；再套一层 3s 兜底超时，避免极端情况下坏句柄读阻塞。
+    let mut probe = driver::FastbootDriver::new(transport);
+    probe.set_auto_retry(false);
+    match tokio::time::timeout(std::time::Duration::from_secs(3), probe.check_connection()).await {
+        // 设备正常应答 → 句柄可用，交还调用方
+        Ok(Ok(true)) => Ok(probe.into_transport()),
+        // 协议层错误：IO 其实是通的（句柄好），照常交还
+        Ok(Err(_)) => Ok(probe.into_transport()),
+        // 传输层错误或探测超时 → 坏句柄，触发外层退避重开
+        Ok(Ok(false)) | Err(_) => Err(FastbootError::Transport(error::TransportError::NoLink)),
+    }
 }
 
 fn connect_adb(
@@ -2022,5 +2139,196 @@ async fn cmd_resize_logical_partition(
     let cmd = format!("resize-logical-partition:{}:{}", name, size);
     driver.raw_command(&cmd).await?;
     print_success(&format!("逻辑分区 {} 已调整为 {}", name, format_size(size)));
+    Ok(())
+}
+
+/// fastboot boot <image>：下载一个完整 boot 镜像并临时引导（不写入任何分区）。
+/// 注：host 端用 kernel+ramdisk 合成 boot 镜像需 mkbootimg，风险高且未实现；
+/// 这里只支持直接引导完整 boot/recovery 镜像（覆盖绝大多数实际用法）。
+async fn cmd_boot(
+    serial: &Option<String>,
+    kernel: &Path,
+    ramdisk: Option<&Path>,
+) -> Result<(), FastbootError> {
+    if ramdisk.is_some() {
+        return Err(FastbootError::InvalidArg(
+            "boot 仅支持引导完整 boot 镜像（fastboot boot boot.img）；\
+             host 端合成 kernel+ramdisk 需 mkbootimg，未实现。请传入完整镜像。"
+                .into(),
+        ));
+    }
+    if !kernel.exists() {
+        return Err(FastbootError::ImageNotFound(kernel.display().to_string()));
+    }
+    let data = fs::read(kernel).map_err(FastbootError::Io)?;
+    if data.is_empty() {
+        return Err(FastbootError::InvalidArg("镜像文件为空".into()));
+    }
+
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    print_info(&format!(
+        "下载并引导 {} ({})",
+        kernel.display(),
+        format_size(data.len() as u64)
+    ));
+
+    let pb = setup_live_progress(&mut driver, "boot", data.len() as u64);
+    driver.download(&data).await?;
+    driver.boot().await?;
+    pb.finish_and_clear();
+
+    print_success("已发送 boot，设备应正在引导该镜像");
+    Ok(())
+}
+
+/// fastboot stage <file>：把文件下载到设备暂存区（不写分区、不引导），供后续 oem / get_staged 使用。
+async fn cmd_stage(serial: &Option<String>, input: &Path) -> Result<(), FastbootError> {
+    if !input.exists() {
+        return Err(FastbootError::ImageNotFound(input.display().to_string()));
+    }
+    let data = fs::read(input).map_err(FastbootError::Io)?;
+    if data.is_empty() {
+        return Err(FastbootError::InvalidArg("文件为空".into()));
+    }
+
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    print_info(&format!(
+        "暂存 {} ({}) 到设备",
+        input.display(),
+        format_size(data.len() as u64)
+    ));
+
+    let pb = setup_live_progress(&mut driver, "stage", data.len() as u64);
+    driver.download(&data).await?;
+    pb.finish_and_clear();
+
+    print_success(&format!("已暂存 {}", format_size(data.len() as u64)));
+    Ok(())
+}
+
+/// fastboot get_staged <output>：把设备暂存区数据回传到主机文件（upload 协议命令）。
+async fn cmd_get_staged(serial: &Option<String>, output: &Path) -> Result<(), FastbootError> {
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    print_info(&format!("从设备取回暂存数据到 {}...", output.display()));
+    let size = driver.upload_to_file(output).await?;
+
+    print_success(&format!(
+        "已取回 {} -> {}",
+        format_size(size),
+        output.display()
+    ));
+    Ok(())
+}
+
+/// fastboot gsi <wipe|disable|enable|status>：管理设备上的 GSI/DSU（设备端 `gsi:<op>` 命令）。
+async fn cmd_gsi(serial: &Option<String>, operation: &str) -> Result<(), FastbootError> {
+    let op = operation.trim().to_ascii_lowercase();
+    if op.is_empty() {
+        return Err(FastbootError::InvalidArg(
+            "gsi 需指定操作：wipe / disable / enable / status".into(),
+        ));
+    }
+
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    let (resp, info) = driver.raw_command_with_info(&format!("gsi:{}", op)).await?;
+    for line in &info {
+        println!("(bootloader) {}", line);
+    }
+    match resp {
+        protocol::Response::Okay(v) => {
+            if !v.is_empty() {
+                println!("{}", v);
+            }
+            print_success(&format!("gsi {} 完成", op));
+            Ok(())
+        }
+        protocol::Response::Fail(msg) => Err(FastbootError::Device(msg)),
+        _ => Err(FastbootError::Protocol("gsi 返回了非预期响应".into())),
+    }
+}
+
+/// fastboot snapshot-update <cancel|merge>：虚拟 A/B 快照管理（设备端 `snapshot-update:<op>` 命令）。
+async fn cmd_snapshot_update(
+    serial: &Option<String>,
+    operation: &str,
+) -> Result<(), FastbootError> {
+    let op = operation.trim().to_ascii_lowercase();
+    if op != "cancel" && op != "merge" {
+        return Err(FastbootError::InvalidArg(
+            "snapshot-update 仅支持 cancel 或 merge".into(),
+        ));
+    }
+
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    let (resp, info) = driver
+        .raw_command_with_info(&format!("snapshot-update:{}", op))
+        .await?;
+    for line in &info {
+        println!("(bootloader) {}", line);
+    }
+    match resp {
+        protocol::Response::Okay(v) => {
+            if !v.is_empty() {
+                println!("{}", v);
+            }
+            print_success(&format!("snapshot-update {} 完成", op));
+            Ok(())
+        }
+        protocol::Response::Fail(msg) => Err(FastbootError::Device(msg)),
+        _ => Err(FastbootError::Protocol(
+            "snapshot-update 返回了非预期响应".into(),
+        )),
+    }
+}
+
+/// fastboot wipe-super <super_empty.img>：用空 super 镜像重置动态分区（super）元数据。
+/// 需设备处于 fastbootd（userspace fastboot）模式；主机端凭设备元数据生成空 super 需 liblp、未实现，
+/// 故要求传入厂商固件包内的 super_empty.img。
+async fn cmd_wipe_super(
+    serial: &Option<String>,
+    super_empty: Option<&Path>,
+) -> Result<(), FastbootError> {
+    let img = match super_empty {
+        Some(p) => p,
+        None => {
+            return Err(FastbootError::InvalidArg(
+                "wipe-super 需要提供 super_empty.img：fastboot wipe-super super_empty.img\n  \
+                 （主机端凭设备 super 元数据生成空镜像需 liblp、未实现；请用固件包内的 super_empty.img）"
+                    .into(),
+            ))
+        }
+    };
+    if !img.exists() {
+        return Err(FastbootError::ImageNotFound(img.display().to_string()));
+    }
+    let data = fs::read(img).map_err(FastbootError::Io)?;
+    if data.is_empty() {
+        return Err(FastbootError::InvalidArg("super_empty 镜像为空".into()));
+    }
+
+    let transport = open_transport(serial).await?;
+    let mut driver = driver::FastbootDriver::new(transport);
+
+    print_info(&format!(
+        "重置 super 分区元数据（{}）。注意：需设备处于 fastbootd 模式。",
+        format_size(data.len() as u64)
+    ));
+
+    let pb = setup_live_progress(&mut driver, "super", data.len() as u64);
+    driver.download(&data).await?;
+    driver.flash("super").await?;
+    pb.finish_and_clear();
+
+    print_success("super 分区已重置（wipe-super 完成）");
     Ok(())
 }

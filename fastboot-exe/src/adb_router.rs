@@ -1,16 +1,20 @@
-use crate::adb_protocol::A_OKAY;
 use crate::adb_winusb_transport::AdbWinUsbDevice;
 use std::env;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::process;
-use std::thread;
 
-const SYNC_DATA_MAX: usize = 64 * 1024;
-const SYNC_SEND: &[u8; 4] = b"SEND";
-const SYNC_DATA: &[u8; 4] = b"DATA";
-const SYNC_DONE: &[u8; 4] = b"DONE";
-const SYNC_OKAY: &[u8; 4] = b"OKAY";
+/// 判断本程序是否以 "adb" 身份被调用：只看可执行文件名(去扩展名)是否等于 adb。
+/// 不能用「整条路径包含 adb」来判断——部署目录名为 AdbToolbox 等含 "adb" 字样时会误判，
+/// 致使所有 fastboot 子命令落入兜底分支被当 adb 未知命令而静默 exit(0) 空跑。
+fn invoked_as_adb() -> bool {
+    env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(Path::file_stem)
+        .map(|s| s.to_string_lossy().to_lowercase() == "adb")
+        .unwrap_or(false)
+}
 
 pub fn try_handle_adb_args() -> Option<i32> {
     let mut args: Vec<String> = env::args().skip(1).collect();
@@ -25,10 +29,8 @@ pub fn try_handle_adb_args() -> Option<i32> {
     args.retain(|x| x != "-d" && x != "-e");
 
     if args.is_empty() {
-        if let Ok(exe_path) = env::current_exe() {
-            if exe_path.to_string_lossy().to_lowercase().contains("adb") {
-                process::exit(0);
-            }
+        if invoked_as_adb() {
+            process::exit(0);
         }
         return None;
     }
@@ -62,10 +64,8 @@ pub fn try_handle_adb_args() -> Option<i32> {
             handle_shell(shell_args)
         }
         _ => {
-            if let Ok(exe_path) = env::current_exe() {
-                if exe_path.to_string_lossy().to_lowercase().contains("adb") {
-                    process::exit(0);
-                }
+            if invoked_as_adb() {
+                process::exit(0);
             }
             None
         }
@@ -111,12 +111,21 @@ fn handle_devices_native() -> Option<i32> {
 }
 
 fn extract_serial_from_path(path: &str) -> String {
-    path.rsplit('\\')
-        .next()
-        .and_then(|s| s.split('#').nth(1))
-        .and_then(|s| s.split('&').next())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    // 设备路径形如: \\?\usb#vid_18d1&pid_4ee7#a7ab3ab5#{guid}
+    // 序列号是按 '#' 分割后的第 3 段(index 2)。
+    // 旧实现取 index 1(vid_xxxx&pid_xxxx)再 split('&'),错误地显示成 vid_18d1。
+    let parts: Vec<&str> = path.split('#').collect();
+    if parts.len() >= 3 {
+        let serial = parts[2];
+        if !serial.is_empty()
+            && !serial.starts_with('{')
+            && !serial.contains('&')
+            && serial.len() < 64
+        {
+            return serial.to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 fn handle_reverse(args: &[String]) -> Option<i32> {
@@ -156,216 +165,89 @@ fn handle_forward(args: &[String]) -> Option<i32> {
 fn handle_push_native(local: &str, remote: &str) -> Option<i32> {
     let local_path = Path::new(local);
     if !local_path.exists() {
+        eprintln!("本地文件不存在: {}", local);
         return Some(1);
     }
 
-    let file = match std::fs::File::open(local_path) {
-        Ok(f) => f,
-        Err(_) => {
-            return Some(1);
-        }
-    };
-
-    let metadata = match file.metadata() {
-        Ok(m) => m,
-        Err(_) => {
-            return Some(1);
-        }
-    };
-
-    let mut dev = match AdbWinUsbDevice::open_any() {
+    // 统一走 WinUSB 直连 + 完善的 dev.push()(与 main.rs 的 Commands::Push 一致)。
+    // 旧实现是手写的简化 sync 协议(write_stream 逐包硬等 A_OKAY、未跳过 arg1 不匹配的
+    // 幽灵包、未校验最终 SYNC ack),真机 push 稳定失败 exit 1。
+    let devices = match AdbWinUsbDevice::enumerate() {
         Ok(d) => d,
         Err(_) => {
+            eprintln!("枚举 ADB 设备失败");
             return Some(1);
         }
     };
-
-    if let Err(_) = dev.connect() {
+    if devices.is_empty() {
+        eprintln!("未检测到处于 ADB 模式的设备");
         return Some(1);
     }
 
-    let (loc_id, rem_id) = match dev.open_stream("sync:") {
-        Ok(ids) => ids,
+    let mut dev = match AdbWinUsbDevice::open_device(&devices[0].device_path) {
+        Ok(d) => d,
         Err(_) => {
+            eprintln!("无法打开设备句柄");
             return Some(1);
         }
     };
 
-    let mode = 33206;
-    let send_path = format!("{},{}", remote, mode);
-    let path_bytes = send_path.as_bytes();
-
-    let mut send_msg = Vec::with_capacity(8 + path_bytes.len());
-    send_msg.extend_from_slice(SYNC_SEND);
-    send_msg.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
-    send_msg.extend_from_slice(path_bytes);
-
-    if let Err(_) = dev.write_stream(loc_id, rem_id, &send_msg) {
-        return Some(1);
-    }
-
-    let mut file = file;
-    let mut buf = vec![0u8; SYNC_DATA_MAX];
-
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut data_msg = Vec::with_capacity(8 + n);
-                data_msg.extend_from_slice(SYNC_DATA);
-                data_msg.extend_from_slice(&(n as u32).to_le_bytes());
-                data_msg.extend_from_slice(&buf[..n]);
-
-                if let Err(_) = dev.write_stream(loc_id, rem_id, &data_msg) {
-                    return Some(1);
-                }
-            }
-            Err(_) => {
-                return Some(1);
-            }
+    match dev.push(local, remote) {
+        Ok(_) => {
+            println!("{}: 1 file pushed", remote);
+            Some(0)
+        }
+        Err(e) => {
+            eprintln!("Push 失败: {}", e);
+            Some(1)
         }
     }
-
-    let mtime = metadata
-        .modified()
-        .map(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as u32
-        })
-        .unwrap_or(0);
-
-    let mut done_msg = Vec::with_capacity(8);
-    done_msg.extend_from_slice(SYNC_DONE);
-    done_msg.extend_from_slice(&mtime.to_le_bytes());
-
-    if let Err(_) = dev.write_stream(loc_id, rem_id, &done_msg) {
-        return Some(1);
-    }
-
-    let final_header = match dev.read_header() {
-        Ok(h) => h,
-        Err(_) => {
-            return Some(1);
-        }
-    };
-
-    let final_data = if final_header.data_length > 0 {
-        let mut data = vec![0u8; final_header.data_length as usize];
-        match dev.read_exact(&mut data) {
-            Ok(_) => data,
-            Err(_) => {
-                return Some(1);
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    if &final_data != SYNC_OKAY {
-        return Some(1);
-    }
-
-    let ok_header = crate::adb_protocol::AdbMessageHeader::new(A_OKAY, rem_id, loc_id, 0);
-    if let Err(_) = dev.write_header(&ok_header) {
-        return Some(1);
-    }
-
-    if let Err(_) = dev.close_stream(loc_id, rem_id) {
-        return Some(1);
-    }
-
-    process::exit(0);
 }
 
 fn handle_shell(args: &[String]) -> Option<i32> {
-    let has_args = !args.is_empty();
-    let cmd_str = if has_args {
-        args.join(" ")
-    } else {
-        String::new()
-    };
-
-    let mut stream = match crate::adb_handler::connect_device_transport(None) {
-        Ok(s) => s,
+    // 统一走 WinUSB 直连(与 main.rs 的 Commands::Shell 一致)。
+    // 旧实现依赖本地 127.0.0.1:5037 的官方 ADB server,但本程序是 WinUSB 直连、
+    // 从不启动 ADB server,导致连接被拒 -> shell 返回空且 exit 1。
+    let devices = match AdbWinUsbDevice::enumerate() {
+        Ok(d) => d,
         Err(_) => {
+            eprintln!("枚举 ADB 设备失败");
+            return Some(1);
+        }
+    };
+    if devices.is_empty() {
+        eprintln!("未检测到处于 ADB 模式的设备");
+        return Some(1);
+    }
+
+    let mut dev = match AdbWinUsbDevice::open_device(&devices[0].device_path) {
+        Ok(d) => d,
+        Err(_) => {
+            eprintln!("无法打开设备句柄");
             return Some(1);
         }
     };
 
-    let shell_cmd = if has_args {
-        format!("shell:{}", cmd_str)
+    if args.is_empty() {
+        // 无参数 = 交互式终端
+        if let Err(e) = dev.true_pty_shell() {
+            eprintln!("终端异常 {}", e);
+            return Some(1);
+        }
+        Some(0)
     } else {
-        "shell:".to_string()
-    };
-
-    if let Err(_) = crate::adb_handler::send_request(&mut stream, &shell_cmd) {
-        return Some(1);
-    }
-
-    let stdout = io::stdout();
-    let mut stdout_lock = stdout.lock();
-
-    if has_args {
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stdout_lock.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    if stdout_lock.flush().is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        // 单条命令: 一次性执行并输出
+        let cmd_string = args.join(" ");
+        match dev.shell_command(&cmd_string) {
+            Ok(output) => {
+                print!("{}", output);
+                let _ = io::stdout().flush();
+                Some(0)
+            }
+            Err(e) => {
+                eprintln!("执行失败 {}", e);
+                Some(1)
             }
         }
-        process::exit(0);
-    } else {
-        let mut stream_clone = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => {
-                return Some(1);
-            }
-        };
-
-        thread::spawn(move || {
-            let stdin = io::stdin();
-            let mut stdin_lock = stdin.lock();
-            let mut buf = [0u8; 1024];
-            loop {
-                match stdin_lock.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stream_clone.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                        if stream_clone.flush().is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let mut buf = [0u8; 8192];
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stdout_lock.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    if stdout_lock.flush().is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        process::exit(0);
     }
 }
