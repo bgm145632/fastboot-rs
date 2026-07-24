@@ -15,6 +15,7 @@ pub mod boot_patch;
 pub mod defs;
 
 // --- Internal modules (same crate graph as the `ksud` binary) ---
+#[cfg(target_os = "android")]
 mod apk_sign;
 mod assets;
 #[cfg(target_os = "android")]

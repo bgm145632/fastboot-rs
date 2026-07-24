@@ -1,4 +1,4 @@
-use std::fs::{File, copy};
+use std::fs::File;
 use std::io::{BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -434,8 +434,14 @@ fn find_boot_image(
     partition: &Option<String>,
     verbose: bool,
 ) -> Result<(PathBuf, Option<String>)> {
+    #[cfg(not(target_os = "android"))]
+    let _ = (kmi, ota, is_replace_kernel, workdir, partition);
+
     let bootimage;
+    #[cfg(target_os = "android")]
     let mut bootdevice = None;
+    #[cfg(not(target_os = "android"))]
+    let bootdevice = None;
     if let Some(ref image) = *image {
         ensure!(image.exists(), "boot image not found");
         bootimage = std::fs::canonicalize(image)?;
@@ -443,7 +449,9 @@ fn find_boot_image(
         #[cfg(not(target_os = "android"))]
         {
             if verbose {
-                println!("- Current OS is not android, refusing auto bootimage/bootdevice detection");
+                println!(
+                    "- Current OS is not android, refusing auto bootimage/bootdevice detection"
+                );
             }
             bail!("Please specify a boot image");
         }
@@ -492,6 +500,8 @@ pub struct BootPatchArgs {
     pub magiskboot: Option<PathBuf>,
     #[arg(long, default_value = None)]
     pub kmi: Option<String>,
+    #[arg(long, value_enum, default_value_t = KernelSuSource::Embedded, conflicts_with = "module")]
+    pub kernelsu_source: KernelSuSource,
     #[cfg(target_os = "android")]
     #[arg(long, default_value = None)]
     pub partition: Option<String>,
@@ -515,7 +525,67 @@ pub struct BootPatchArgs {
     pub verbose: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum KernelSuSource {
+    #[default]
+    Embedded,
+    Official,
+    #[value(name = "sukisu-ultra")]
+    SukiSuUltra,
+    #[value(name = "kernelsu-next")]
+    KernelSuNext,
+    #[value(name = "wild-ksu")]
+    WildKsu,
+}
+
+impl KernelSuSource {
+    const fn distribution(self) -> Option<crate::assets::KernelSuDistribution> {
+        use crate::assets::KernelSuDistribution;
+
+        match self {
+            Self::Embedded => None,
+            Self::Official => Some(KernelSuDistribution::Official),
+            Self::SukiSuUltra => Some(KernelSuDistribution::SukiSuUltra),
+            Self::KernelSuNext => Some(KernelSuDistribution::KernelSuNext),
+            Self::WildKsu => Some(KernelSuDistribution::WildKsu),
+        }
+    }
+}
+
 impl BootPatchArgs {
+    #[must_use]
+    pub fn for_remote_patch(
+        boot: PathBuf,
+        out_dir: PathBuf,
+        out_file_name: String,
+        kmi: Option<String>,
+        kernelsu_source: KernelSuSource,
+    ) -> Self {
+        Self {
+            boot: Some(boot),
+            kernel: None,
+            module: None,
+            init: None,
+            #[cfg(target_os = "android")]
+            ota: false,
+            #[cfg(target_os = "android")]
+            flash: false,
+            out: Some(out_dir),
+            magiskboot: None,
+            kmi,
+            kernelsu_source,
+            #[cfg(target_os = "android")]
+            partition: None,
+            out_name: Some(out_file_name),
+            cmdline: None,
+            allow_shell: false,
+            enable_adbd: false,
+            adb_debug_prop: None,
+            no_install: false,
+            verbose: false,
+        }
+    }
+
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn for_embedded_flash(
@@ -538,6 +608,7 @@ impl BootPatchArgs {
             out: Some(out_dir),
             magiskboot: None,
             kmi,
+            kernelsu_source: KernelSuSource::Embedded,
             #[cfg(target_os = "android")]
             partition: None,
             out_name: Some(out_file_name),
@@ -561,6 +632,7 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
             out,
             magiskboot: magiskboot_path,
             kmi,
+            kernelsu_source,
             out_name,
             cmdline,
             allow_shell,
@@ -639,11 +711,25 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
         )?;
 
         #[cfg(target_os = "android")]
-        let (bootimage, bootdevice) =
-            find_boot_image(&image, &kmi, ota, is_replace_kernel, workdir, &partition, verbose)?;
+        let (bootimage, bootdevice) = find_boot_image(
+            &image,
+            &kmi,
+            ota,
+            is_replace_kernel,
+            workdir,
+            &partition,
+            verbose,
+        )?;
         #[cfg(not(target_os = "android"))]
-        let (bootimage, _) =
-            find_boot_image(&image, &kmi, false, is_replace_kernel, workdir, &None, verbose)?;
+        let (bootimage, _) = find_boot_image(
+            &image,
+            &kmi,
+            false,
+            is_replace_kernel,
+            workdir,
+            &None,
+            verbose,
+        )?;
 
         let bootimage = bootimage.as_path();
         let local_boot_name = "boot_orig.img";
@@ -668,8 +754,21 @@ pub fn patch(args: BootPatchArgs) -> Result<()> {
                 println!("- KMI: {kmi}");
             }
             let name = format!("{kmi}_kernelsu.ko");
-            crate::assets::copy_assets_to_file(&name, kmod_file)
-                .with_context(|| format!("Failed to copy {name}"))?;
+            match kernelsu_source.distribution() {
+                None => crate::assets::copy_assets_to_file(&name, kmod_file),
+                Some(distribution) => {
+                    let tag = crate::assets::download_distribution_ko_to_file(
+                        distribution,
+                        &kmi,
+                        kmod_file,
+                    )?;
+                    if verbose {
+                        println!("- Downloaded {} {tag}", distribution.name());
+                    }
+                    Ok(())
+                }
+            }
+            .with_context(|| format!("Failed to copy {name}"))?;
         }
 
         let init_file = workdir.join("init");
